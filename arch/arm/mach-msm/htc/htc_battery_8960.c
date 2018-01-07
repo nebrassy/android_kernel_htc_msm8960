@@ -32,7 +32,7 @@
 #include <linux/miscdevice.h>
 #include <linux/pmic8058-xoadc.h>
 #include <mach/mpp.h>
-#include <linux/android_alarm.h>
+#include <linux/alarmtimer.h>
 #include <linux/suspend.h>
 #include <linux/earlysuspend.h>
 
@@ -64,9 +64,6 @@ static int chg_dis_control_mask = HTC_BATT_CHG_DIS_BIT_ID
 static int chg_dis_pj_mask = HTC_BATT_CHG_DIS_BIT_ID
 								| HTC_BATT_CHG_DIS_BIT_TMR;
 
-#ifdef CONFIG_FORCE_FAST_CHARGE
-#include <linux/fastchg.h>
-#endif
 
 #define HTC_BATT_PWRSRC_DIS_BIT_MFG		(1)
 #define HTC_BATT_PWRSRC_DIS_BIT_API		(1<<1)
@@ -435,13 +432,7 @@ int htc_charger_event_notify(enum htc_charger_event event)
 		htc_batt_schedule_batt_info_update();
 		break;
 	case HTC_CHARGER_EVENT_SRC_USB: 
-		if (force_fast_charge == 1) {
-			printk("[FASTCHARGE] Forcing CHARGER_AC");
-			latest_chg_src = CHARGER_AC;
-		} else {
-			printk("[FASTCHARGE] NOT set, using normal CHARGER_USB");
-			latest_chg_src = CHARGER_USB;
-		}
+		latest_chg_src = CHARGER_USB;
 		htc_batt_schedule_batt_info_update();
 		break;
 	case HTC_CHARGER_EVENT_SRC_AC: 
@@ -462,7 +453,7 @@ int htc_charger_event_notify(enum htc_charger_event event)
 								UNKNOWN_USB_DETECT_DELAY_MS)));
 		break;
 	case HTC_CHARGER_EVENT_SRC_UNKNOWN_USB: 
-		if ((get_kernel_flag() & KERNEL_FLAG_ENABLE_FAST_CHARGE) || force_fast_charge == 1)
+		if (get_kernel_flag() & KERNEL_FLAG_ENABLE_FAST_CHARGE)
 			latest_chg_src = CHARGER_AC;
 		else
 			latest_chg_src = CHARGER_UNKNOWN_USB;
@@ -1033,7 +1024,9 @@ static void htc_batt_get_battery_ui_soc(int *soc_ui)
 
 static int htc_battery_get_rt_attr(enum htc_batt_rt_attr attr, int *val)
 {
-	int ret = 0;
+	int ret = -EINVAL;
+	if (unlikely(!htc_batt_info.igauge))
+		return ret;
 	switch (attr) {
 	case HTC_BATT_RT_VOLTAGE:
 		if (htc_batt_info.igauge->get_battery_voltage)
@@ -1229,8 +1222,9 @@ static int htc_batt_get_battery_info(struct battery_info_reply *htc_batt_update)
 	htc_batt_update->pj_src = htc_batt_info.rep.pj_src;
 	htc_batt_update->pj_chg_status = htc_batt_info.rep.pj_chg_status;
 	htc_batt_update->pj_full = htc_batt_info.rep.pj_full;
-	htc_batt_update->pj_level= htc_batt_info.rep.pj_level;
-	htc_batt_update->pj_level_pre= htc_batt_info.rep.pj_level_pre;
+	htc_batt_update->pj_level = htc_batt_info.rep.pj_level;
+	htc_batt_update->pj_level_pre = htc_batt_info.rep.pj_level_pre;
+	htc_batt_update->cc_uah = htc_batt_info.rep.cc_uah;
 	return 0;
 }
 
@@ -1332,10 +1326,10 @@ static void batt_regular_timer_handler(unsigned long data)
 	}
 }
 
-static void batt_check_alarm_handler(struct alarm *alarm)
+static enum alarmtimer_restart batt_check_alarm_handler(struct alarm *alarm, ktime_t now)
 {
 	BATT_LOG("alarm handler, but do nothing.");
-	return;
+	return ALARMTIMER_NORESTART;
 }
 
 static int bounding_fullly_charged_level(int upperbd, int current_level)
@@ -1450,7 +1444,10 @@ static void batt_update_info_from_gauge(void)
 	}
 
 	
-	
+	if (htc_batt_info.igauge->get_battery_cc)
+		htc_batt_info.igauge->get_battery_cc(
+				&htc_batt_info.rep.cc_uah);
+
 	if (htc_batt_info.igauge->get_battery_voltage)
 		htc_batt_info.igauge->get_battery_voltage(
 				&htc_batt_info.rep.batt_vol);
@@ -2650,7 +2647,6 @@ static void htc_battery_late_resume(struct early_suspend *h)
 static int htc_battery_prepare(struct device *dev)
 {
 	ktime_t interval;
-	ktime_t slack = ktime_set(0, 0);
 	ktime_t next_alarm;
 	struct timespec xtime;
 	unsigned long cur_jiffies, sensor0_temp = 0;
@@ -2697,9 +2693,8 @@ static int htc_battery_prepare(struct device *dev)
 		suspend_highfreq_check_reason, htc_batt_info.state,
 		batt_temp, sensor0_temp);
 
-	next_alarm = ktime_add(alarm_get_elapsed_realtime(), interval);
-	alarm_start_range(&htc_batt_timer.batt_check_wakeup_alarm,
-				next_alarm, ktime_add(next_alarm, slack));
+	next_alarm = ktime_add(ktime_get_boottime(), interval);
+	alarm_start_relative(&htc_batt_timer.batt_check_wakeup_alarm, next_alarm);
 
 	return 0;
 }
@@ -2859,7 +2854,7 @@ static int htc_battery_probe(struct platform_device *pdev)
 	init_timer(&htc_batt_timer.batt_timer);
 	htc_batt_timer.batt_timer.function = batt_regular_timer_handler;
 	alarm_init(&htc_batt_timer.batt_check_wakeup_alarm,
-			ANDROID_ALARM_ELAPSED_REALTIME_WAKEUP,
+			ALARM_REALTIME,
 			batt_check_alarm_handler);
 	htc_batt_timer.batt_wq = create_singlethread_workqueue("batt_timer");
 
