@@ -1,4 +1,4 @@
-- [x] - [ ] - [ ] VERSION = 3
+VERSION = 3
 PATCHLEVEL = 4
 SUBLEVEL = 113
 EXTRAVERSION =
